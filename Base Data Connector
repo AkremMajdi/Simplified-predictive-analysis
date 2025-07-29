@@ -1,0 +1,204 @@
+import time
+import requests
+import logging
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
+import json
+import pandas as pd
+
+
+class RateLimiter:
+    """Simple rate limiter to handle API rate limits"""
+
+    def __init__(self, max_requests: int, time_window: int):
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = []
+
+    def wait_if_needed(self):
+        """Wait if necessary to respect rate limits"""
+        now = time.time()
+        # Remove old requests outside the time window
+        self.requests = [req_time for req_time in self.requests if now - req_time < self.time_window]
+
+        if len(self.requests) >= self.max_requests:
+            # Wait until the oldest request is outside the time window
+            sleep_time = self.time_window - (now - self.requests[0]) + 0.1
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                self.requests = []
+
+        self.requests.append(now)
+
+
+class BaseDataConnector(ABC):
+    """
+    Base class for all data connectors providing common functionality
+    """
+
+    def __init__(self, api_key: Optional[str] = None, base_url: str = "",
+                 rate_limit_requests: int = 100, rate_limit_window: int = 60):
+        """
+        Initialize the base connector
+
+        Args:
+            api_key: API key for authentication
+            base_url: Base URL for the API
+            rate_limit_requests: Maximum requests per time window
+            rate_limit_window: Time window in seconds
+        """
+        self.api_key = api_key
+        self.base_url = base_url
+        self.rate_limiter = RateLimiter(rate_limit_requests, rate_limit_window)
+        self.session = requests.Session()
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+        # Set up logging
+        logging.basicConfig(level=logging.INFO)
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Get headers for API requests"""
+        headers = {
+            'User-Agent': 'DataConnector/1.0',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+
+        if self.api_key:
+            headers['Authorization'] = f'Bearer {self.api_key}'
+
+        return headers
+
+    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None,
+                     method: str = 'GET', data: Optional[Dict[str, Any]] = None,
+                     max_retries: int = 3) -> Dict[str, Any]:
+        """
+        Make an API request with rate limiting and error handling
+
+        Args:
+            endpoint: API endpoint
+            params: Query parameters
+            method: HTTP method
+            data: Request body data
+            max_retries: Maximum number of retries
+
+        Returns:
+            JSON response as dictionary
+        """
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        headers = self._get_headers()
+
+        for attempt in range(max_retries + 1):
+            try:
+                # Apply rate limiting
+                self.rate_limiter.wait_if_needed()
+
+                # Make the request
+                if method.upper() == 'GET':
+                    response = self.session.get(url, headers=headers, params=params, timeout=30)
+                elif method.upper() == 'POST':
+                    response = self.session.post(url, headers=headers, params=params,
+                                               json=data, timeout=30)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+
+                # Handle rate limiting responses
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get('Retry-After', 60))
+                    self.logger.warning(f"Rate limited. Waiting {retry_after} seconds...")
+                    time.sleep(retry_after)
+                    continue
+
+                # Raise for other HTTP errors
+                response.raise_for_status()
+
+                # Return JSON response
+                return response.json()
+
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"Request failed (attempt {attempt + 1}): {e}")
+                if attempt == max_retries:
+                    raise
+
+                # Exponential backoff
+                wait_time = 2 ** attempt
+                self.logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+
+        raise Exception("Max retries exceeded")
+
+    def _normalize_data(self, raw_data: Any) -> pd.DataFrame:
+        """
+        Normalize raw API data into a pandas DataFrame
+
+        Args:
+            raw_data: Raw data from API
+
+        Returns:
+            Normalized DataFrame
+        """
+        if isinstance(raw_data, list):
+            return pd.DataFrame(raw_data)
+        elif isinstance(raw_data, dict):
+            # Try to find the main data array in the response
+            for key in ['data', 'results', 'items', 'records']:
+                if key in raw_data and isinstance(raw_data[key], list):
+                    return pd.DataFrame(raw_data[key])
+
+            # If no array found, create DataFrame from the dict itself
+            return pd.DataFrame([raw_data])
+        else:
+            raise ValueError(f"Cannot normalize data of type {type(raw_data)}")
+
+    def _validate_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Validate and clean the normalized data
+
+        Args:
+            df: DataFrame to validate
+
+        Returns:
+            Validated DataFrame
+        """
+        # Remove completely empty rows
+        df = df.dropna(how='all')
+
+        # Add timestamp for when data was retrieved
+        df['retrieved_at'] = datetime.now()
+
+        return df
+
+    @abstractmethod
+    def get_data(self, **kwargs) -> pd.DataFrame:
+        """
+        Abstract method to get data from the API
+
+        Returns:
+            DataFrame containing the retrieved data
+        """
+        pass
+
+    @abstractmethod
+    def get_available_datasets(self) -> List[Dict[str, Any]]:
+        """
+        Abstract method to get available datasets from the API
+
+        Returns:
+            List of available datasets with metadata
+        """
+        pass
+
+    def test_connection(self) -> bool:
+        """
+        Test the connection to the API
+
+        Returns:
+            True if connection is successful, False otherwise
+        """
+        try:
+            datasets = self.get_available_datasets()
+            return len(datasets) > 0
+        except Exception as e:
+            self.logger.error(f"Connection test failed: {e}")
+            return False
