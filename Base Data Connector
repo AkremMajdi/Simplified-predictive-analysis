@@ -7,8 +7,8 @@ from datetime import datetime, timedelta
 import json
 import pandas as pd
 
-
 class RateLimiter:
+
     """Simple rate limiter to handle API rate limits"""
 
     def __init__(self, max_requests: int, time_window: int):
@@ -33,6 +33,7 @@ class RateLimiter:
 
 
 class BaseDataConnector(ABC):
+
     """
     Base class for all data connectors providing common functionality
     """
@@ -54,10 +55,11 @@ class BaseDataConnector(ABC):
         self.session = requests.Session()
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        # Set up logging
+        #Set up logging
         logging.basicConfig(level=logging.INFO)
 
     def _get_headers(self) -> Dict[str, str]:
+
         """Get headers for API requests"""
         headers = {
             'User-Agent': 'DataConnector/1.0',
