@@ -165,7 +165,7 @@ class BaseDataConnector(ABC):
         df = df.dropna(how='all')
 
         # Add timestamp for when data was retrieved
-        df['retrieved_at'] = datetime.now()
+        df['retrieved_at'] = datetime.utcnow()
 
         return df
 
