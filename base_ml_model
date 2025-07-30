@@ -1,0 +1,337 @@
+import pandas as pd
+import numpy as np
+import joblib
+import json
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, List, Tuple, Union
+from datetime import datetime
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+import logging
+
+
+class BaseMLModel(ABC):
+    """
+    Base class for all machine learning models providing common functionality
+    """
+    
+    def __init__(self, model_name: str, model_type: str = 'regression'):
+        """
+        Initialize the base ML model
+        
+        Args:
+            model_name: Name of the model
+            model_type: Type of model ('regression', 'classification', 'time_series')
+        """
+        self.model_name = model_name
+        self.model_type = model_type
+        self.model = None
+        self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
+        self.feature_names = []
+        self.target_name = ""
+        self.is_trained = False
+        self.training_history = {}
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
+        # Set up logging
+        logging.basicConfig(level=logging.INFO)
+    
+    def preprocess_data(self, X: pd.DataFrame, y: Optional[pd.Series] = None, 
+                       fit_preprocessors: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Preprocess features and target data
+        
+        Args:
+            X: Feature data
+            y: Target data (optional)
+            fit_preprocessors: Whether to fit the preprocessors
+            
+        Returns:
+            Tuple of preprocessed (X, y)
+        """
+        # Handle missing values
+        X_processed = X.fillna(X.mean() if X.select_dtypes(include=[np.number]).shape[1] > 0 else X.mode().iloc[0])
+        
+        # Store feature names
+        if fit_preprocessors:
+            self.feature_names = list(X.columns)
+        
+        # Scale numerical features
+        numerical_cols = X_processed.select_dtypes(include=[np.number]).columns
+        if len(numerical_cols) > 0:
+            if fit_preprocessors:
+                X_processed[numerical_cols] = self.scaler.fit_transform(X_processed[numerical_cols])
+            else:
+                X_processed[numerical_cols] = self.scaler.transform(X_processed[numerical_cols])
+        
+        # Encode categorical features
+        categorical_cols = X_processed.select_dtypes(include=['object']).columns
+        for col in categorical_cols:
+            if fit_preprocessors:
+                X_processed[col] = self.label_encoder.fit_transform(X_processed[col].astype(str))
+            else:
+                # Handle unseen categories
+                try:
+                    X_processed[col] = self.label_encoder.transform(X_processed[col].astype(str))
+                except ValueError:
+                    # Assign unknown category to most frequent class
+                    most_frequent = self.label_encoder.classes_[0]
+                    X_processed[col] = X_processed[col].apply(
+                        lambda x: x if x in self.label_encoder.classes_ else most_frequent
+                    )
+                    X_processed[col] = self.label_encoder.transform(X_processed[col])
+        
+        X_array = X_processed.values
+        
+        # Process target if provided
+        y_array = None
+        if y is not None:
+            if self.model_type == 'classification' and y.dtype == 'object':
+                if fit_preprocessors:
+                    y_array = self.label_encoder.fit_transform(y)
+                else:
+                    y_array = self.label_encoder.transform(y)
+            else:
+                y_array = y.values
+        
+        return X_array, y_array
+    
+    def split_data(self, X: pd.DataFrame, y: pd.Series, 
+                   test_size: float = 0.2, random_state: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """
+        Split data into training and testing sets
+        
+        Args:
+            X: Feature data
+            y: Target data
+            test_size: Proportion of data for testing
+            random_state: Random seed
+            
+        Returns:
+            Tuple of (X_train, X_test, y_train, y_test)
+        """
+        return train_test_split(X, y, test_size=test_size, random_state=random_state)
+    
+    def evaluate_model(self, X_test: np.ndarray, y_test: np.ndarray) -> Dict[str, float]:
+        """
+        Evaluate the trained model
+        
+        Args:
+            X_test: Test features
+            y_test: Test targets
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        if not self.is_trained:
+            raise ValueError("Model must be trained before evaluation")
+        
+        y_pred = self.model.predict(X_test)
+        
+        if self.model_type == 'regression':
+            metrics = {
+                'mse': mean_squared_error(y_test, y_pred),
+                'rmse': np.sqrt(mean_squared_error(y_test, y_pred)),
+                'mae': mean_absolute_error(y_test, y_pred),
+                'r2': r2_score(y_test, y_pred)
+            }
+        elif self.model_type == 'classification':
+            metrics = {
+                'accuracy': accuracy_score(y_test, y_pred),
+                'precision': precision_score(y_test, y_pred, average='weighted'),
+                'recall': recall_score(y_test, y_pred, average='weighted'),
+                'f1': f1_score(y_test, y_pred, average='weighted')
+            }
+        else:
+            # Time series or custom metrics
+            metrics = {
+                'mse': mean_squared_error(y_test, y_pred),
+                'mae': mean_absolute_error(y_test, y_pred)
+            }
+        
+        return metrics
+    
+    def cross_validate(self, X: np.ndarray, y: np.ndarray, cv: int = 5) -> Dict[str, float]:
+        """
+        Perform cross-validation
+        
+        Args:
+            X: Feature data
+            y: Target data
+            cv: Number of cross-validation folds
+            
+        Returns:
+            Dictionary of cross-validation scores
+        """
+        if not self.is_trained:
+            raise ValueError("Model must be trained before cross-validation")
+        
+        if self.model_type == 'regression':
+            scoring = 'neg_mean_squared_error'
+        else:
+            scoring = 'accuracy'
+        
+        scores = cross_val_score(self.model, X, y, cv=cv, scoring=scoring)
+        
+        return {
+            'mean_score': scores.mean(),
+            'std_score': scores.std(),
+            'scores': scores.tolist()
+        }
+    
+    def get_feature_importance(self) -> Optional[Dict[str, float]]:
+        """
+        Get feature importance if available
+        
+        Returns:
+            Dictionary of feature importance scores
+        """
+        if not self.is_trained:
+            return None
+        
+        if hasattr(self.model, 'feature_importances_'):
+            importance = self.model.feature_importances_
+            return dict(zip(self.feature_names, importance))
+        elif hasattr(self.model, 'coef_'):
+            importance = np.abs(self.model.coef_)
+            if importance.ndim > 1:
+                importance = importance.mean(axis=0)
+            return dict(zip(self.feature_names, importance))
+        else:
+            return None
+    
+    def save_model(self, filepath: str):
+        """
+        Save the trained model and preprocessors
+        
+        Args:
+            filepath: Path to save the model
+        """
+        if not self.is_trained:
+            raise ValueError("Model must be trained before saving")
+        
+        model_data = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'label_encoder': self.label_encoder,
+            'feature_names': self.feature_names,
+            'target_name': self.target_name,
+            'model_name': self.model_name,
+            'model_type': self.model_type,
+            'training_history': self.training_history,
+            'is_trained': self.is_trained
+        }
+        
+        joblib.dump(model_data, filepath)
+        self.logger.info(f"Model saved to {filepath}")
+    
+    def load_model(self, filepath: str):
+        """
+        Load a trained model and preprocessors
+        
+        Args:
+            filepath: Path to load the model from
+        """
+        model_data = joblib.load(filepath)
+        
+        self.model = model_data['model']
+        self.scaler = model_data['scaler']
+        self.label_encoder = model_data['label_encoder']
+        self.feature_names = model_data['feature_names']
+        self.target_name = model_data['target_name']
+        self.model_name = model_data['model_name']
+        self.model_type = model_data['model_type']
+        self.training_history = model_data['training_history']
+        self.is_trained = model_data['is_trained']
+        
+        self.logger.info(f"Model loaded from {filepath}")
+    
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Make predictions on new data
+        
+        Args:
+            X: Feature data for prediction
+            
+        Returns:
+            Array of predictions
+        """
+        if not self.is_trained:
+            raise ValueError("Model must be trained before making predictions")
+        
+        X_processed, _ = self.preprocess_data(X, fit_preprocessors=False)
+        predictions = self.model.predict(X_processed)
+        
+        # Inverse transform if classification with label encoding
+        if self.model_type == 'classification' and hasattr(self.label_encoder, 'classes_'):
+            try:
+                predictions = self.label_encoder.inverse_transform(predictions.astype(int))
+            except:
+                pass  # Keep original predictions if inverse transform fails
+        
+        return predictions
+    
+    def predict_proba(self, X: pd.DataFrame) -> Optional[np.ndarray]:
+        """
+        Get prediction probabilities for classification models
+        
+        Args:
+            X: Feature data for prediction
+            
+        Returns:
+            Array of prediction probabilities or None
+        """
+        if not self.is_trained or self.model_type != 'classification':
+            return None
+        
+        if not hasattr(self.model, 'predict_proba'):
+            return None
+        
+        X_processed, _ = self.preprocess_data(X, fit_preprocessors=False)
+        return self.model.predict_proba(X_processed)
+    
+    @abstractmethod
+    def train(self, X: pd.DataFrame, y: pd.Series, **kwargs) -> Dict[str, Any]:
+        """
+        Abstract method to train the model
+        
+        Args:
+            X: Feature data
+            y: Target data
+            **kwargs: Additional training parameters
+            
+        Returns:
+            Training results and metrics
+        """
+        pass
+    
+    @abstractmethod
+    def get_model_params(self) -> Dict[str, Any]:
+        """
+        Abstract method to get model parameters
+        
+        Returns:
+            Dictionary of model parameters
+        """
+        pass
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """
+        Get comprehensive model information
+        
+        Returns:
+            Dictionary with model information
+        """
+        return {
+            'model_name': self.model_name,
+            'model_type': self.model_type,
+            'is_trained': self.is_trained,
+            'feature_names': self.feature_names,
+            'target_name': self.target_name,
+            'training_history': self.training_history,
+            'model_params': self.get_model_params() if self.is_trained else None,
+            'feature_importance': self.get_feature_importance()
+        }
